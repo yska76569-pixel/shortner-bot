@@ -1,8 +1,8 @@
 {
   "name": "this-person-is-brand-telegram-shortener-bot",
-  "version": "1.0.0",
+  "version": "2.0.0",
   "private": true,
-  "description": "Railway-ready Telegram bot for THIS PERSON IS BRAND Shortener API",
+  "description": "Railway-ready Telegram shortener bot with PostgreSQL persistence",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
@@ -14,6 +14,7 @@
     "axios": "^1.7.9",
     "express": "^4.21.2",
     "node-telegram-bot-api": "^0.66.0",
+    "pg": "^8.13.1",
     "qrcode": "^1.5.4"
   }
 }

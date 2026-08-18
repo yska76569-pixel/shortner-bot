@@ -1,3 +1,4 @@
+
 const TelegramBot = require('node-telegram-bot-api');
 const axios = require('axios');
 const QRCode = require('qrcode');
@@ -204,13 +205,30 @@ function cancelKeyboard() {
   return { inline_keyboard: [[{ text: '❌ Cancel', callback_data: 'cancel' }]] };
 }
 
-function domainKeyboard() {
-  const rows = SHORTENER_DOMAINS.map((domain, i) => [{
-    text: `🌐 ${domain}`,
-    callback_data: `domain:${i}` // short callback_data, safely below Telegram's limit
-  }]);
-  rows.push([{ text: '❌ Cancel', callback_data: 'cancel' }]);
-  return { inline_keyboard: rows };
+async function fetchWebsiteDomains() {
+  const r=await api.get('/api/v1/domains');
+  if(r.status!==200) throw new Error(r.data?.error||'Could not load website domains');
+  return Array.isArray(r.data?.domains)?r.data.domains:[];
+}
+
+function domainKeyboard(domains) {
+  const rows=[];
+  domains.forEach((item,i)=>{
+    const domain=String(item.domain||'').trim(); if(!domain)return;
+    if(item.selectable) rows.push([{text:`✅ ${domain}`,callback_data:`domain:${i}`}]);
+    else rows.push([{text:`${item.maintenance?'🛠 Maintenance':'⏳ Unavailable'} • ${domain}`,callback_data:`domainoff:${i}`}]);
+  });
+  rows.push([{text:'🔄 Refresh Domains',callback_data:'domains_refresh'}]);
+  rows.push([{text:'❌ Cancel',callback_data:'cancel'}]);
+  return {inline_keyboard:rows};
+}
+
+async function askForDomain(chatId,state){
+  try{
+    const domains=await fetchWebsiteDomains(); state.domains=domains; state.step='domain'; sessions.set(chatId,state);
+    const ready=domains.filter(d=>d.selectable).length;
+    return bot.sendMessage(chatId,`🌐 <b>Choose Short Domain</b>\n\n✅ Ready: <b>${ready}</b>\n📋 Detected from website: <b>${domains.length}</b>\n\nNew website domains appear after Refresh Domains.`,{parse_mode:'HTML',reply_markup:domainKeyboard(domains)});
+  }catch(e){console.error('Domain sync error:',e.message);return bot.sendMessage(chatId,'❌ Could not load domains from website API. Website V7.17+ is required.');}
 }
 
 function expiryKeyboard() {
@@ -340,11 +358,10 @@ async function showLinks(chatId, telegramUserId) {
         parse_mode: 'HTML',
         disable_web_page_preview: true,
         reply_markup: {
-          inline_keyboard: [[
-            { text: '🌐 Open', url: shortUrl },
-            // Short database ID instead of full/base64 URL.
-            { text: '📱 QR', callback_data: `qrdb:${dbId}` }
-          ]]
+          inline_keyboard: [
+            [{ text: '🌐 Open', url: shortUrl },{ text: '📱 QR', callback_data: `qrdb:${dbId}` }],
+            [{ text: '✏️ Edit Destination', callback_data: `edit:${l.id}` }]
+          ]
         }
       }
     );
@@ -460,9 +477,7 @@ bot.onText(/\/shorten(?:\s+(.+))?/, async (msg, match) => {
   });
 
   if (inlineUrl) {
-    await bot.sendMessage(chatId, '🌐 Choose the short-link domain:', {
-      reply_markup: domainKeyboard()
-    });
+    await askForDomain(chatId, sessions.get(chatId));
   } else {
     await bot.sendMessage(
       chatId,
@@ -541,24 +556,28 @@ bot.on('callback_query', async query => {
       );
     }
 
+    if (data === 'domains_refresh') {
+      const state=sessions.get(chatId); if(!state)return sendMain(chatId,'Session expired. Start again.');
+      return askForDomain(chatId,state);
+    }
+
+    if (data.startsWith('domainoff:')) {
+      return bot.sendMessage(chatId,'⚠️ This domain is unavailable or under maintenance. Choose a Ready domain.');
+    }
+
     if (data.startsWith('domain:')) {
-      const state = sessions.get(chatId);
-      if (!state) return sendMain(chatId, 'Session expired. Start again.');
+      const state=sessions.get(chatId); if(!state)return sendMain(chatId,'Session expired. Start again.');
+      const idx=Number(data.split(':')[1]); const selected=Array.isArray(state.domains)?state.domains[idx]:null;
+      if(!Number.isInteger(idx)||!selected||!selected.selectable)return bot.sendMessage(chatId,'❌ Domain unavailable. Refresh Domains and choose again.');
+      state.domain=selected.domain; state.step='slug_choice'; sessions.set(chatId,state);
+      return bot.sendMessage(chatId,`✅ Domain: <b>${escapeHtml(state.domain)}</b>\n\nDo you want a custom short path?`,{parse_mode:'HTML',reply_markup:yesNoSkipKeyboard('slug')});
+    }
 
-      const idx = Number(data.split(':')[1]);
-      if (!Number.isInteger(idx) || !SHORTENER_DOMAINS[idx]) {
-        return bot.sendMessage(chatId, '❌ Invalid domain.');
-      }
-
-      state.domain = SHORTENER_DOMAINS[idx];
-      state.step = 'slug_choice';
-      sessions.set(chatId, state);
-
-      return bot.sendMessage(
-        chatId,
-        `✅ Domain: <b>${escapeHtml(state.domain)}</b>\n\nDo you want a custom short path?`,
-        { parse_mode: 'HTML', reply_markup: yesNoSkipKeyboard('slug') }
-      );
+    if (data.startsWith('edit:')) {
+      const linkId=Number(data.slice(5));
+      if(!Number.isInteger(linkId)||linkId<=0)return bot.sendMessage(chatId,'❌ Invalid link reference.');
+      sessions.set(chatId,{step:'edit_url',telegramUserId,linkId});
+      return bot.sendMessage(chatId,'✏️ <b>Edit Destination URL</b>\n\nSend the NEW destination URL.\nThe short URL/domain/code will stay the same.',{parse_mode:'HTML',reply_markup:cancelKeyboard()});
     }
 
     if (data === 'slug:yes') {
@@ -668,6 +687,17 @@ bot.on('message', async msg => {
 
     const text = msg.text.trim();
 
+    if (state.step === 'edit_url') {
+      try{const u=new URL(text);if(!['http:','https:'].includes(u.protocol))throw new Error();}
+      catch{return bot.sendMessage(chatId,'❌ Please send a valid http:// or https:// URL.');}
+      const r=await api.patch(`/api/v1/links/${state.linkId}`,{url:text});
+      if(r.status!==200){await logActivity(msg.from.id,'link_edit_failed',{linkId:state.linkId,status:r.status,error:r.data?.error||null});return apiError(chatId,r,'Could not update this short link');}
+      const d=r.data||{};
+      await pool.query(`UPDATE telegram_bot_links SET original_url=$1 WHERE telegram_user_id=$2 AND short_url=$3`,[d.originalUrl||text,msg.from.id,d.shortUrl||'']);
+      await logActivity(msg.from.id,'link_edit_success',{linkId:state.linkId,shortUrl:d.shortUrl}); sessions.delete(chatId);
+      return bot.sendMessage(chatId,`✅ <b>Destination Updated</b>\n\n🔗 Short URL stays the same:\n<code>${escapeHtml(d.shortUrl||'')}</code>\n\n➡️ New destination:\n${escapeHtml(d.originalUrl||text)}`,{parse_mode:'HTML',disable_web_page_preview:true,reply_markup:mainKeyboard()});
+    }
+
     if (state.step === 'url') {
       try {
         const u = new URL(text);
@@ -677,11 +707,8 @@ bot.on('message', async msg => {
       }
 
       state.url = text;
-      state.step = 'domain';
       sessions.set(chatId, state);
-      return bot.sendMessage(chatId, '🌐 Choose the short-link domain:', {
-        reply_markup: domainKeyboard()
-      });
+      return askForDomain(chatId, state);
     }
 
     if (state.step === 'slug') {
@@ -754,7 +781,7 @@ async function start() {
     console.log(`✅ Health server running on port ${PORT}`);
     console.log(`🤖 Telegram bot polling started`);
     console.log(`📡 Shortener API: ${SHORTENER_BASE_URL}`);
-    console.log(`🌐 Domains configured: ${SHORTENER_DOMAINS.length}`);
+    console.log(`🌐 Dynamic website domain sync: ENABLED`);
     console.log(`🗄 PostgreSQL: CONNECTED`);
     console.log(`🔐 API key: ${SHORTENER_API_KEY ? 'SET' : 'MISSING'}`);
     console.log(`🔑 Bot token: ${BOT_TOKEN ? 'SET' : 'MISSING'}`);

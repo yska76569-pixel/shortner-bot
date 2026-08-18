@@ -1,8 +1,8 @@
 {
   "name": "this-person-is-brand-telegram-shortener-bot",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "private": true,
-  "description": "Railway-ready Telegram shortener bot with PostgreSQL persistence",
+  "description": "Telegram shortener bot with PostgreSQL, live website domains, and destination editing",
   "main": "bot.js",
   "scripts": {
     "start": "node bot.js"
